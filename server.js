@@ -1,5 +1,5 @@
 const express = require('express');
-const { MongoClient } = require('mongodb');
+const { MongoClient, ObjectId } = require('mongodb');
 const cors = require('cors');
 const NodeCache = require('node-cache');
 require('dotenv').config();
@@ -8,237 +8,120 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Initialize cache with 5 minute TTL
-const cache = new NodeCache({ stdTTL: 300 });
+const searchCache = new NodeCache({ 
+  stdTTL: 300,  // 5 minutes
+  checkperiod: 60,  // Check for expired keys every minute
+  maxKeys: 1000  // Maximum number of keys
+});
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// MongoDB connection
-let db;
-let collection;
+// MongoDB connections
+let masterDb;
+let masterClient;
+let enterpriseDb;
+let enterpriseClient;
+let enterpriseCollection;
 
-async function connectToMongoDB() {
+async function connectToMasterDB() {
   try {
-    const client = new MongoClient(process.env.MONGODB_URI);
-    await client.connect();
-    db = client.db(process.env.DB_NAME || 'your_database');
-    collection = db.collection('im_sku_flat_table');
-    console.log('Connected to MongoDB Atlas');
+    masterClient = new MongoClient(process.env.MONGODB_URI);
+    await masterClient.connect();
+    masterDb = masterClient.db('crm-production');
   } catch (error) {
-    console.error('MongoDB connection error:', error);
+    console.error('Master MongoDB connection error:', error);
     process.exit(1);
   }
 }
 
-// Optimized search function
-async function searchWithPagination(searchQuery, page = 1, limit = 10) {
-  const skip = (page - 1) * limit;
-  
-  const pipeline = [
-    {
-      '$search': {
-        index: 'im_sku_flat_table',
-        compound: {
-          should: [
-            // Primary fields with highest boost
-            {
-              text: {
-                query: searchQuery,
-                path: 'name',
-                fuzzy: { maxEdits: 2 },
-                score: { boost: { value: 10 } }
-              }
-            },
-            {
-              text: {
-                query: searchQuery,
-                path: 'sku_code',
-                fuzzy: { maxEdits: 2 },
-                score: { boost: { value: 10 } }
-              }
-            },
-            {
-              text: {
-                query: searchQuery,
-                path: 'sku',
-                fuzzy: { maxEdits: 2 },
-                score: { boost: { value: 10 } }
-              }
-            },
-            {
-              text: {
-                query: searchQuery,
-                path: 'ref_item_code',
-                fuzzy: { maxEdits: 2 },
-                score: { boost: { value: 10 } }
-              }
-            },
-            {
-              text: {
-                query: searchQuery,
-                path: 'ref_sku_code',
-                fuzzy: { maxEdits: 2 },
-                score: { boost: { value: 10 } }
-              }
-            },
-            // Category fields with medium boost
-            {
-              text: {
-                query: searchQuery,
-                path: 'category_name1',
-                fuzzy: { maxEdits: 2 },
-                score: { boost: { value: 8 } }
-              }
-            },
-            {
-              text: {
-                query: searchQuery,
-                path: 'category_name2',
-                fuzzy: { maxEdits: 2 },
-                score: { boost: { value: 8 } }
-              }
-            },
-            {
-              text: {
-                query: searchQuery,
-                path: 'category_name3',
-                fuzzy: { maxEdits: 2 },
-                score: { boost: { value: 8 } }
-              }
-            },
-            {
-              text: {
-                query: searchQuery,
-                path: 'category_name4',
-                fuzzy: { maxEdits: 2 },
-                score: { boost: { value: 8 } }
-              }
-            },
-            {
-              text: {
-                query: searchQuery,
-                path: 'category_name5',
-                fuzzy: { maxEdits: 2 },
-                score: { boost: { value: 8 } }
-              }
-            },
-            // Barcode fields
-            {
-              text: {
-                query: searchQuery,
-                path: 'barcodes.type',
-                fuzzy: { maxEdits: 2 },
-                score: { boost: { value: 7 } }
-              }
-            },
-            {
-              text: {
-                query: searchQuery,
-                path: 'barcodes.barcode',
-                fuzzy: { maxEdits: 2 },
-                score: { boost: { value: 7 } }
-              }
-            },
-            // Attribute fields
-            {
-              text: {
-                query: searchQuery,
-                path: 'a1',
-                fuzzy: { maxEdits: 2 },
-                score: { boost: { value: 5 } }
-              }
-            },
-            {
-              text: {
-                query: searchQuery,
-                path: 'a2',
-                fuzzy: { maxEdits: 2 },
-                score: { boost: { value: 5 } }
-              }
-            },
-            {
-              text: {
-                query: searchQuery,
-                path: 'a3',
-                fuzzy: { maxEdits: 2 },
-                score: { boost: { value: 5 } }
-              }
-            }
-          ],
-          minimumShouldMatch: 1
-        }
-      }
-    },
-    {
-      '$match': { deletedAt: null }
-    },
-    {
-      '$addFields': { score: { '$meta': 'searchScore' } }
-    },
-    {
-      '$match': { score: { '$gt': 4 } }
-    },
-    {
-      '$facet': {
-        'results': [
-          { '$sort': { score: -1 } },
-          { '$skip': skip },
-          { '$limit': limit },
-          {
-            '$project': {
-              _id: 1,
-              name: 1,
-              sku_code: 1,
-              vendor_item_id: 1,
-              ref_item_code: 1,
-              ref_sku_code: 1,
-              category_name1: 1,
-              category_name2: 1,
-              category_name3: 1,
-              category_name4: 1,
-              category_name5: 1,
-              barcodes: 1,
-              score: 1,
-              createdAt: 1,
-              updatedAt: 1
-            }
-          }
-        ],
-        'metadata': [
-          { '$count': 'totalCount' }
-        ]
-      }
-    },
-    {
-      '$project': {
-        results: 1,
-        totalCount: { '$arrayElemAt': ['$metadata.totalCount', 0] },
-        currentPage: { '$literal': page },
-        pageSize: { '$literal': limit },
-        totalPages: {
-          '$ceil': {
-            '$divide': [
-              { '$arrayElemAt': ['$metadata.totalCount', 0] },
-              limit
-            ]
-          }
-        }
-      }
-    }
-  ];
-
+async function connectToEnterpriseDB(enterpriseId) {
   try {
-    const result = await collection.aggregate(pipeline).toArray();
-    return result[0] || { results: [], totalCount: 0, currentPage: page, pageSize: limit, totalPages: 0 };
+    const enterprise = await masterDb.collection('enterprises').findOne({ 
+      _id: new ObjectId(enterpriseId),
+      deletedOn: null 
+    });
+
+    if (!enterprise?.meta?.dbConfig?.dbName) {
+      throw new Error('Enterprise not found or configuration missing');
+    }
+
+    enterpriseClient = new MongoClient(process.env.MONGODB_URI);
+    await enterpriseClient.connect();
+    enterpriseDb = enterpriseClient.db(enterprise.meta.dbConfig.dbName);
+    enterpriseCollection = enterpriseDb.collection('im_sku_flat_table');
+    return enterprise;
   } catch (error) {
-    console.error('Error executing search pipeline:', error);
+    if (enterpriseClient) {
+      await enterpriseClient.close();
+    }
     throw error;
   }
 }
 
-// Fast count-only function
+async function getAllEnterprises() {
+  return await masterDb.collection('enterprises')
+    .find({ 
+      deletedOn: null,
+      liveStatus: 1
+    })
+    .project({
+      _id: 1,
+      tradeName: 1,
+      legalName: 1,
+      baCode: 1,
+      email: 1,
+      'meta.dbConfig.dbName': 1
+    })
+    .toArray();
+}
+
+async function searchWithPagination(searchQuery, page = 1, limit = 10) {
+  const skip = (page - 1) * limit;
+  
+  if (!enterpriseCollection) {
+    throw new Error('No enterprise collection available');
+  }
+
+  const startTime = Date.now();
+  const searchConditions = {
+    $text: { 
+      $search: searchQuery,
+      $caseSensitive: false,
+      $diacriticSensitive: false
+    },
+    deletedAt: null
+  };
+
+  const totalCount = await enterpriseCollection.countDocuments(searchConditions);
+  const results = await enterpriseCollection
+    .find(searchConditions)
+    .sort({ score: { $meta: "textScore" } })
+    .skip(skip)
+    .limit(limit)
+    .project({
+      _id: 1,
+      name: 1,
+      sku_code: 1,
+      score: { $meta: "textScore" }
+    })
+    .toArray();
+
+  const executionTime = Date.now() - startTime;
+  console.log(`Search executed in ${executionTime}ms`);
+
+  return {
+    results,
+    totalCount,
+    currentPage: page,
+    pageSize: limit,
+    totalPages: Math.ceil(totalCount / limit),
+    executionTime
+  };
+}
+
 async function getSearchCountOnly(searchQuery) {
   const pipeline = [
     {
@@ -250,21 +133,35 @@ async function getSearchCountOnly(searchQuery) {
               text: {
                 query: searchQuery,
                 path: 'name',
-                fuzzy: { maxEdits: 2 }
+                fuzzy: { maxEdits: 2, prefixLength: 1 }
               }
             },
             {
               text: {
                 query: searchQuery,
                 path: 'sku_code',
-                fuzzy: { maxEdits: 2 }
+                fuzzy: { maxEdits: 2, prefixLength: 1 }
               }
             },
             {
               text: {
                 query: searchQuery,
                 path: 'vendor_item_id',
-                fuzzy: { maxEdits: 2 }
+                fuzzy: { maxEdits: 2, prefixLength: 1 }
+              }
+            },
+            {
+              text: {
+                query: searchQuery,
+                path: 'ref_item_code',
+                fuzzy: { maxEdits: 2, prefixLength: 1 }
+              }
+            },
+            {
+              text: {
+                query: searchQuery,
+                path: 'ref_sku_code',
+                fuzzy: { maxEdits: 2, prefixLength: 1 }
               }
             }
           ],
@@ -278,87 +175,74 @@ async function getSearchCountOnly(searchQuery) {
   ];
 
   try {
-    const result = await collection.aggregate(pipeline).toArray();
+    const result = await enterpriseCollection.aggregate(pipeline).toArray();
     return result[0]?.count || 0;
   } catch (error) {
-    console.error('Error executing count pipeline:', error);
     throw error;
   }
 }
 
 // API Routes
-app.get('/api/search', async (req, res) => {
+app.get('/api/enterprises', async (req, res) => {
   try {
-    const { q: query, page = 1, limit = 10, countOnly = false } = req.query;
-    
-    if (!query || query.trim() === '') {
-      return res.status(400).json({ error: 'Search query is required' });
-    }
-
-    const pageNum = parseInt(page);
-    const limitNum = parseInt(limit);
-    const cacheKey = `search_${query}_${pageNum}_${limitNum}_${countOnly}`;
-    
-    // Check cache first
-    const cachedResult = cache.get(cacheKey);
-    if (cachedResult) {
-      return res.json({
-        ...cachedResult,
-        cached: true,
-        timestamp: new Date().toISOString()
-      });
-    }
-
-    // Perform search
-    const startTime = Date.now();
-    let result;
-
-    if (countOnly === 'true') {
-      const count = await getSearchCountOnly(query);
-      result = { totalCount: count };
-    } else {
-      result = await searchWithPagination(query, pageNum, limitNum);
-    }
-
-    const executionTime = Date.now() - startTime;
-
-    // Add metadata
-    const response = {
-      ...result,
-      query,
-      executionTime: `${executionTime}ms`,
-      timestamp: new Date().toISOString(),
-      cached: false
-    };
-
-    // Cache the result
-    cache.set(cacheKey, response);
-
-    res.json(response);
+    const enterprises = await getAllEnterprises();
+    res.json(enterprises);
   } catch (error) {
-    console.error('Search error:', error);
-    res.status(500).json({ 
-      error: 'Internal server error', 
-      message: error.message 
-    });
+    res.status(500).json({ error: 'Failed to fetch enterprises' });
   }
 });
 
-// Health check endpoint
-app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
-    timestamp: new Date().toISOString(),
-    cache: {
-      keys: cache.keys().length,
-      stats: cache.getStats()
+app.post('/api/enterprise/connect', async (req, res) => {
+  try {
+    const { enterpriseId } = req.body;
+    if (!enterpriseId) {
+      return res.status(400).json({ error: 'Enterprise ID is required' });
     }
-  });
+
+    const enterprise = await connectToEnterpriseDB(enterpriseId);
+    res.json({ 
+      message: 'Connected to enterprise database',
+      enterprise: {
+        id: enterprise._id,
+        name: enterprise.tradeName,
+        dbName: enterprise.meta.dbConfig.dbName
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-// Clear cache endpoint
-app.delete('/api/cache', (req, res) => {
-  cache.flushAll();
+app.get('/api/search', async (req, res) => {
+  try {
+    const { q: query, page = 1, limit = 10 } = req.query;
+    
+    if (!query?.trim()) {
+      return res.status(400).json({ error: 'Search query is required' });
+    }
+
+    if (!enterpriseCollection) {
+      return res.status(400).json({ error: 'No enterprise selected' });
+    }
+
+    const result = await searchWithPagination(query, parseInt(page), parseInt(limit));
+    res.json({
+      ...result,
+      query,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'OK' });
+});
+
+// Add cache clearing endpoint
+app.post('/api/cache/clear', (req, res) => {
+  searchCache.flushAll();
   res.json({ message: 'Cache cleared successfully' });
 });
 
@@ -373,9 +257,11 @@ app.get('/', (req, res) => {
         <title>MongoDB Atlas Search Demo</title>
         <style>
             body { font-family: Arial, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; }
+            .container { margin-bottom: 20px; }
             .search-container { margin-bottom: 20px; }
             .search-input { width: 300px; padding: 10px; font-size: 16px; }
             .search-btn { padding: 10px 20px; font-size: 16px; margin-left: 10px; }
+            .enterprise-select { width: 300px; padding: 10px; font-size: 16px; margin-bottom: 10px; }
             .results-container { margin-top: 20px; }
             .result-item { border: 1px solid #ddd; padding: 15px; margin: 10px 0; border-radius: 5px; }
             .score { background: #e7f3ff; padding: 2px 6px; border-radius: 3px; font-size: 12px; }
@@ -386,16 +272,22 @@ app.get('/', (req, res) => {
             .metadata { background: #f8f9fa; padding: 10px; border-radius: 5px; margin: 10px 0; }
             .loading { text-align: center; padding: 20px; }
             .error { color: red; padding: 10px; background: #ffe6e6; border-radius: 5px; }
+            .enterprise-info { background: #e7f3ff; padding: 10px; border-radius: 5px; margin-bottom: 10px; }
         </style>
     </head>
     <body>
         <h1>MongoDB Atlas Search Demo</h1>
         
+        <div class="container">
+            <select id="enterpriseSelect" class="enterprise-select">
+                <option value="">Select Enterprise</option>
+            </select>
+            <div id="enterpriseInfo" class="enterprise-info" style="display: none;"></div>
+        </div>
+
         <div class="search-container">
-            <input type="text" id="searchInput" class="search-input" placeholder="Search products..." />
-            <button onclick="performSearch()" class="search-btn">Search</button>
-            <button onclick="getCountOnly()" class="search-btn">Count Only</button>
-            <button onclick="clearCache()" class="search-btn">Clear Cache</button>
+            <input type="text" id="searchInput" class="search-input" placeholder="Search products..." disabled />
+            <button onclick="performSearch()" class="search-btn" disabled>Search</button>
         </div>
 
         <div id="loading" class="loading" style="display: none;">Searching...</div>
@@ -408,14 +300,71 @@ app.get('/', (req, res) => {
             let currentQuery = '';
             let currentPage = 1;
             const pageSize = 10;
+            let currentEnterprise = null;
 
-            document.getElementById('searchInput').addEventListener('keypress', function(e) {
-                if (e.key === 'Enter') {
-                    performSearch();
+            async function loadEnterprises() {
+                try {
+                    const response = await fetch('/api/enterprises');
+                    const enterprises = await response.json();
+                    
+                    const select = document.getElementById('enterpriseSelect');
+                    enterprises.forEach(enterprise => {
+                        const option = document.createElement('option');
+                        option.value = enterprise._id;
+                        option.textContent = \`\${enterprise.tradeName} (\${enterprise.baCode})\`;
+                        select.appendChild(option);
+                    });
+                } catch (error) {
+                    showError('Failed to load enterprises: ' + error.message);
+                }
+            }
+
+            document.getElementById('enterpriseSelect').addEventListener('change', async function(e) {
+                const enterpriseId = e.target.value;
+                if (!enterpriseId) {
+                    document.getElementById('searchInput').disabled = true;
+                    document.querySelector('.search-btn').disabled = true;
+                    document.getElementById('enterpriseInfo').style.display = 'none';
+                    return;
+                }
+
+                try {
+                    const response = await fetch('/api/enterprise/connect', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ enterpriseId })
+                    });
+
+                    if (!response.ok) throw new Error('Failed to connect to enterprise');
+
+                    const data = await response.json();
+                    currentEnterprise = data.enterprise;
+
+                    document.getElementById('searchInput').disabled = false;
+                    document.querySelector('.search-btn').disabled = false;
+                    
+                    const infoDiv = document.getElementById('enterpriseInfo');
+                    infoDiv.innerHTML = \`
+                        <strong>Connected to:</strong> \${currentEnterprise.name}<br>
+                        <strong>Database:</strong> \${currentEnterprise.dbName}
+                    \`;
+                    infoDiv.style.display = 'block';
+
+                } catch (error) {
+                    showError('Failed to connect to enterprise: ' + error.message);
                 }
             });
 
+            document.getElementById('searchInput').addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') performSearch();
+            });
+
             async function performSearch(page = 1) {
+                if (!currentEnterprise) {
+                    showError('Please select an enterprise first');
+                    return;
+                }
+
                 const query = document.getElementById('searchInput').value.trim();
                 if (!query) return;
 
@@ -429,9 +378,7 @@ app.get('/', (req, res) => {
                     const response = await fetch(\`/api/search?q=\${encodeURIComponent(query)}&page=\${page}&limit=\${pageSize}\`);
                     const data = await response.json();
 
-                    if (!response.ok) {
-                        throw new Error(data.error || 'Search failed');
-                    }
+                    if (!response.ok) throw new Error(data.error || 'Search failed');
 
                     displayResults(data);
                     displayMetadata(data);
@@ -443,41 +390,10 @@ app.get('/', (req, res) => {
                 }
             }
 
-            async function getCountOnly() {
-                const query = document.getElementById('searchInput').value.trim();
-                if (!query) return;
-
-                showLoading(true);
-                hideError();
-
-                try {
-                    const response = await fetch(\`/api/search?q=\${encodeURIComponent(query)}&countOnly=true\`);
-                    const data = await response.json();
-
-                    if (!response.ok) {
-                        throw new Error(data.error || 'Count failed');
-                    }
-
-                    document.getElementById('results').innerHTML = \`
-                        <div class="result-item">
-                            <h3>Total Count: \${data.totalCount}</h3>
-                            <p>Execution Time: \${data.executionTime}</p>
-                            <p>Cached: \${data.cached ? 'Yes' : 'No'}</p>
-                        </div>
-                    \`;
-                    displayMetadata(data);
-                    document.getElementById('pagination').innerHTML = '';
-                } catch (error) {
-                    showError(error.message);
-                } finally {
-                    showLoading(false);
-                }
-            }
-
             function displayResults(data) {
                 const resultsContainer = document.getElementById('results');
                 
-                if (!data.results || data.results.length === 0) {
+                if (!data.results?.length) {
                     resultsContainer.innerHTML = '<p>No results found.</p>';
                     return;
                 }
@@ -486,8 +402,6 @@ app.get('/', (req, res) => {
                     <div class="result-item">
                         <h3>\${item.name || 'N/A'}</h3>
                         <p><strong>SKU:</strong> \${item.sku_code || 'N/A'}</p>
-                        <p><strong>Vendor ID:</strong> \${item.vendor_item_id || 'N/A'}</p>
-                        <p><strong>Category:</strong> \${item.category_name1 || 'N/A'}</p>
                         <p><strong>Score:</strong> <span class="score">\${item.score?.toFixed(2) || 'N/A'}</span></p>
                     </div>
                 \`).join('');
@@ -500,9 +414,8 @@ app.get('/', (req, res) => {
                 const html = \`
                     <strong>Query:</strong> \${data.query || 'N/A'} | 
                     <strong>Total Results:</strong> \${data.totalCount || 0} | 
-                    <strong>Page:</strong> \${data.currentPage || 1} of \${data.totalPages || 1} | 
-                    <strong>Execution Time:</strong> \${data.executionTime || 'N/A'} | 
-                    <strong>Cached:</strong> \${data.cached ? 'Yes' : 'No'}
+                    <strong>Page:</strong> \${data.currentPage || 1} of \${data.totalPages || 1} |
+                    <strong>Execution Time:</strong> \${data.executionTime}ms
                 \`;
                 metadataContainer.innerHTML = html;
                 metadataContainer.style.display = 'block';
@@ -518,10 +431,8 @@ app.get('/', (req, res) => {
 
                 let html = '';
                 
-                // Previous button
                 html += \`<button onclick="performSearch(\${data.currentPage - 1})" \${data.currentPage <= 1 ? 'disabled' : ''}>Previous</button>\`;
                 
-                // Page numbers
                 const startPage = Math.max(1, data.currentPage - 2);
                 const endPage = Math.min(data.totalPages, data.currentPage + 2);
                 
@@ -529,7 +440,6 @@ app.get('/', (req, res) => {
                     html += \`<button onclick="performSearch(\${i})" \${i === data.currentPage ? 'class="active"' : ''}>\${i}</button>\`;
                 }
                 
-                // Next button
                 html += \`<button onclick="performSearch(\${data.currentPage + 1})" \${data.currentPage >= data.totalPages ? 'disabled' : ''}>Next</button>\`;
                 
                 paginationContainer.innerHTML = html;
@@ -549,15 +459,7 @@ app.get('/', (req, res) => {
                 document.getElementById('error').style.display = 'none';
             }
 
-            async function clearCache() {
-                try {
-                    const response = await fetch('/api/cache', { method: 'DELETE' });
-                    const data = await response.json();
-                    alert(data.message);
-                } catch (error) {
-                    alert('Failed to clear cache: ' + error.message);
-                }
-            }
+            loadEnterprises();
         </script>
     </body>
     </html>
@@ -566,17 +468,11 @@ app.get('/', (req, res) => {
 
 // Start server
 async function startServer() {
-  await connectToMongoDB();
-  
-  app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-  });
+  await connectToMasterDB();
+  app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
 }
 
 startServer().catch(console.error);
 
 // Graceful shutdown
-process.on('SIGINT', () => {
-  console.log('Shutting down gracefully...');
-  process.exit(0);
-}); 
+process.on('SIGINT', () => process.exit(0)); 
