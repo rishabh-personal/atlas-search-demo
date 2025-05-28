@@ -52,6 +52,7 @@ async function connectToEnterpriseDB(enterpriseId) {
     await enterpriseClient.connect();
     enterpriseDb = enterpriseClient.db(enterprise.meta.dbConfig.dbName);
     enterpriseCollection = enterpriseDb.collection('im_sku_flat_table');
+
     return enterprise;
   } catch (error) {
     if (enterpriseClient) {
@@ -78,107 +79,68 @@ async function getAllEnterprises() {
     .toArray();
 }
 
-async function searchWithPagination(searchQuery, page = 1, limit = 10) {
-  const skip = (page - 1) * limit;
-  
+async function searchWithPagination(searchQuery, page = 1, limit = 10, lastId = null) {
   if (!enterpriseCollection) {
     throw new Error('No enterprise collection available');
   }
 
   const startTime = Date.now();
-  const searchConditions = {
-    $text: { 
-      $search: searchQuery,
-      $caseSensitive: false,
-      $diacriticSensitive: false
-    },
-    deletedAt: null
-  };
-
-  const totalCount = await enterpriseCollection.countDocuments(searchConditions);
-  const results = await enterpriseCollection
-    .find(searchConditions)
-    .sort({ score: { $meta: "textScore" } })
-    .skip(skip)
-    .limit(limit)
-    .project({
-      _id: 1,
-      name: 1,
-      sku_code: 1,
-      score: { $meta: "textScore" }
-    })
-    .toArray();
-
-  const executionTime = Date.now() - startTime;
-  console.log(`Search executed in ${executionTime}ms`);
-
-  return {
-    results,
-    totalCount,
-    currentPage: page,
-    pageSize: limit,
-    totalPages: Math.ceil(totalCount / limit),
-    executionTime
-  };
-}
-
-async function getSearchCountOnly(searchQuery) {
-  const pipeline = [
-    {
-      '$searchMeta': {
-        index: 'im_sku_flat_table',
-        compound: {
-          should: [
-            {
-              text: {
-                query: searchQuery,
-                path: 'name',
-                fuzzy: { maxEdits: 2, prefixLength: 1 }
-              }
-            },
-            {
-              text: {
-                query: searchQuery,
-                path: 'sku_code',
-                fuzzy: { maxEdits: 2, prefixLength: 1 }
-              }
-            },
-            {
-              text: {
-                query: searchQuery,
-                path: 'vendor_item_id',
-                fuzzy: { maxEdits: 2, prefixLength: 1 }
-              }
-            },
-            {
-              text: {
-                query: searchQuery,
-                path: 'ref_item_code',
-                fuzzy: { maxEdits: 2, prefixLength: 1 }
-              }
-            },
-            {
-              text: {
-                query: searchQuery,
-                path: 'ref_sku_code',
-                fuzzy: { maxEdits: 2, prefixLength: 1 }
-              }
-            }
-          ],
-          minimumShouldMatch: 1,
-          filter: [
-            { equals: { path: 'deletedAt', value: null } }
-          ]
+  
+  try {
+    const pipeline = [
+      {
+        $search: {
+          index: "im_sku_flat_table",
+          autocomplete: {
+            query: searchQuery,
+            path: "name",
+            tokenOrder: "sequential"
+          }
         }
       }
-    }
-  ];
+    ];
 
-  try {
-    const result = await enterpriseCollection.aggregate(pipeline).toArray();
-    return result[0]?.count || 0;
+    // Add cursor condition if lastId is provided
+    if (lastId) {
+      pipeline.push({
+        $match: {
+          _id: { $gt: new ObjectId(lastId) }
+        }
+      });
+    }
+
+    // Add limit and project
+    pipeline.push(
+      {
+        $limit: limit + 1  // Fetch one extra to check if there are more
+      },
+      {
+        $project: {
+          _id: 1,
+          name: 1,
+          sku_code: 1,
+          category_name1: 1
+        }
+      }
+    );
+
+    const results = await enterpriseCollection.aggregate(pipeline).toArray();
+    const hasMore = results.length > limit;
+    const paginatedResults = results.slice(0, limit);
+    const lastResult = paginatedResults[paginatedResults.length - 1];
+    
+    const executionTime = Date.now() - startTime;
+    console.log(`Search executed in ${executionTime}ms`);
+
+    return {
+      results: paginatedResults,
+      nextCursor: hasMore ? lastResult._id.toString() : null,
+      hasMore,
+      executionTime
+    };
   } catch (error) {
-    throw error;
+    console.error('Search error:', error);
+    throw new Error(`Search failed: ${error.message}`);
   }
 }
 
@@ -215,7 +177,8 @@ app.post('/api/enterprise/connect', async (req, res) => {
 
 app.get('/api/search', async (req, res) => {
   try {
-    const { q: query, page = 1, limit = 10 } = req.query;
+    const { q: query, cursor } = req.query;
+    const limit = 10;
     
     if (!query?.trim()) {
       return res.status(400).json({ error: 'Search query is required' });
@@ -225,14 +188,21 @@ app.get('/api/search', async (req, res) => {
       return res.status(400).json({ error: 'No enterprise selected' });
     }
 
-    const result = await searchWithPagination(query, parseInt(page), parseInt(limit));
+    console.log('Search request:', { query, cursor });
+    const result = await searchWithPagination(query, 1, limit, cursor);
+    
     res.json({
       ...result,
       query,
       timestamp: new Date().toISOString()
     });
   } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Search API error:', error);
+    res.status(500).json({ 
+      error: 'Internal server error',
+      message: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -402,6 +372,8 @@ app.get('/', (req, res) => {
                     <div class="result-item">
                         <h3>\${item.name || 'N/A'}</h3>
                         <p><strong>SKU:</strong> \${item.sku_code || 'N/A'}</p>
+                        <p><strong>Vendor ID:</strong> \${item.vendor_item_id || 'N/A'}</p>
+                        <p><strong>Category:</strong> \${item.category_name1 || 'N/A'}</p>
                         <p><strong>Score:</strong> <span class="score">\${item.score?.toFixed(2) || 'N/A'}</span></p>
                     </div>
                 \`).join('');
